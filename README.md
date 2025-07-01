@@ -8,6 +8,6 @@
 ### find exe descriptions.ps1
 * used to browse files in a directory to view their File Descriptions.
 * helpful for skimming through windows exe files
-### [/pwsh/unblockgui.ps1](#unblock with gui finder)
+### [unblock with gui finder](#pwsh/unblockgui.ps1)
 * searches recursively for files that are blocked
 * unblocks files when you click
