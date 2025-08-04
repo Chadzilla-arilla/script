@@ -4,6 +4,10 @@
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 
+# Initialize global lists for known executables
+$global:exeList = @()
+$global:exeSectionMap = @{}
+
 # Create main form
 $form = New-Object System.Windows.Forms.Form
 $form.Text = "File Explorer GUI"
@@ -100,7 +104,9 @@ $listView.MultiSelect = $false
 $listView.Anchor = [System.Windows.Forms.AnchorStyles]::Top -bor [System.Windows.Forms.AnchorStyles]::Bottom -bor [System.Windows.Forms.AnchorStyles]::Left -bor [System.Windows.Forms.AnchorStyles]::Right
 
 # Add columns
+# ListView columns
 $listView.Columns.Add("Name", 200) | Out-Null
+$listView.Columns.Add("Section", 150) | Out-Null
 $listView.Columns.Add("Extension", 80) | Out-Null
 $listView.Columns.Add("Type", 150) | Out-Null
 $listView.Columns.Add("Size", 100) | Out-Null
@@ -348,12 +354,13 @@ function Load-Files {
 				Name           = $file.Name
 				Extension      = $file.Extension
 				Type           = if ($file.Extension) { "$($file.Extension.TrimStart('.').ToUpper()) File" } else { "File" }
-				Size           = $file.Length
-				SizeFormatted  = Format-FileSize -Size $file.Length
-				Description    = $description
-				FullPath       = $file.FullName
-				CreationTime   = $file.CreationTime.ToString('yyyy-MM-dd')
-				LastWriteTime  = $file.LastWriteTime.ToString('yyyy-MM-dd')
+                                Size           = $file.Length
+                                SizeFormatted  = Format-FileSize -Size $file.Length
+                                Description    = $description
+                                Section        = $global:exeSectionMap[$file.Name.ToLower()]
+                                FullPath       = $file.FullName
+                                CreationTime   = $file.CreationTime.ToString('yyyy-MM-dd')
+                                LastWriteTime  = $file.LastWriteTime.ToString('yyyy-MM-dd')
 				LastAccessTime = $file.LastAccessTime.ToString('yyyy-MM-dd')
 				Directory      = $file.DirectoryName
 				Length         = $duration
@@ -367,25 +374,29 @@ function Load-Files {
         $form.Update()
         
         foreach ($fileInfo in $global:allFiles) {
-			$item = New-Object System.Windows.Forms.ListViewItem($fileInfo.Name)
+                        $item = New-Object System.Windows.Forms.ListViewItem($fileInfo.Name)
         # Highlight files not listed in JSON’s exe/exe64 keys
             if (-not ($global:exeList -contains $fileInfo.Name.ToLower())) {
                 $item.ForeColor = 'Red'
+                $item.SubItems.Add("")                  | Out-Null
             }
-			$item.SubItems.Add($fileInfo.Extension)      | Out-Null
-			$item.SubItems.Add($fileInfo.Type)           | Out-Null
-			$item.SubItems.Add($fileInfo.SizeFormatted)  | Out-Null
-			$item.SubItems.Add($fileInfo.Description)    | Out-Null
-			# New columns:
-			$item.SubItems.Add($fileInfo.CreationTime)   | Out-Null
-			$item.SubItems.Add($fileInfo.LastWriteTime)  | Out-Null
-			$item.SubItems.Add($fileInfo.LastAccessTime) | Out-Null
-			$item.SubItems.Add($fileInfo.Directory)      | Out-Null
-			$item.SubItems.Add($fileInfo.Length)         | Out-Null
+            else {
+                $item.SubItems.Add($fileInfo.Section)    | Out-Null
+            }
+                        $item.SubItems.Add($fileInfo.Extension)      | Out-Null
+                        $item.SubItems.Add($fileInfo.Type)           | Out-Null
+                        $item.SubItems.Add($fileInfo.SizeFormatted)  | Out-Null
+                        $item.SubItems.Add($fileInfo.Description)    | Out-Null
+                        # New columns:
+                        $item.SubItems.Add($fileInfo.CreationTime)   | Out-Null
+                        $item.SubItems.Add($fileInfo.LastWriteTime)  | Out-Null
+                        $item.SubItems.Add($fileInfo.LastAccessTime) | Out-Null
+                        $item.SubItems.Add($fileInfo.Directory)      | Out-Null
+                        $item.SubItems.Add($fileInfo.Length)         | Out-Null
 
-			$item.Tag = $fileInfo.FullPath
-			$listView.Items.Add($item)                  | Out-Null
-		}
+                        $item.Tag = $fileInfo.FullPath
+                        $listView.Items.Add($item)                  | Out-Null
+                }
         $exportButton.Enabled = $true
         $progressBar.Visible = $false
         $fileCountLabel.Text = "Files: $($global:allFiles.Count)"
@@ -436,13 +447,21 @@ $browseButton.Add_Click({
             }
         }
 
-        # 2) Build lowercase exe/exe64 list (like the JSON version)
-        $global:exeList = $ini.GetEnumerator() `
-            | Where-Object Key -like 'Software*' `
-            | ForEach-Object { $_.Value.exe, $_.Value.exe64 } `
-            | Where-Object { $_ } `
-            | ForEach-Object { $_.ToLower() } `
-            | Sort-Object -Unique
+        # 2) Build lowercase exe/exe64 list and map each file to its section
+        $global:exeList = @()
+        $global:exeSectionMap = @{}
+
+        foreach ($entry in $ini.GetEnumerator() | Where-Object Key -like 'Software*') {
+            $sectionName = $entry.Key
+            foreach ($exeName in @($entry.Value.exe, $entry.Value.exe64)) {
+                if ($exeName) {
+                    $lower = $exeName.ToLower()
+                    $global:exeList += $lower
+                    $global:exeSectionMap[$lower] = $sectionName
+                }
+            }
+        }
+        $global:exeList = $global:exeList | Sort-Object -Unique
 
         # 3) Point at the .nlp’s folder and reload non-recursively
         $global:currentFolder    = Split-Path $nlpPath
@@ -639,16 +658,17 @@ $listView.Add_ColumnClick({
     # Sort based on column
     switch ($e.Column) {
         0 { $items = $items | Sort-Object { $_.Text } }  # Name
-        1 { $items = $items | Sort-Object { $_.SubItems[1].Text } }  # Extension
-        2 { $items = $items | Sort-Object { $_.SubItems[2].Text } }  # Type
-        3 { 
+        1 { $items = $items | Sort-Object { $_.SubItems[1].Text } }  # Section
+        2 { $items = $items | Sort-Object { $_.SubItems[2].Text } }  # Extension
+        3 { $items = $items | Sort-Object { $_.SubItems[3].Text } }  # Type
+        4 {
             # Sort by actual file size, not formatted string
-            $items = $items | Sort-Object { 
+            $items = $items | Sort-Object {
                 $fileInfo = $global:allFiles | Where-Object { $_.FullPath -eq $_.Tag }
                 if ($fileInfo) { $fileInfo.Size } else { 0 }
             }
         }
-        4 { $items = $items | Sort-Object { $_.SubItems[4].Text } }  # File Description
+        5 { $items = $items | Sort-Object { $_.SubItems[5].Text } }  # File Description
     }
     
     $listView.Items.Clear()
