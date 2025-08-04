@@ -1,3 +1,8 @@
+# NirLauncher config file explorer designed to help locate missing exe files from your NLP file.
+# Page1 displays files which are not in your selected NLP config file's list.
+#     -> Add files colored on page1 to your config if you want.
+# Page2 displays all items in your config and colors files that are missing from your folder.
+#     -> Either find these files and add them to your folder or remove these entries from the NLP file.
 # File Explorer GUI Script
 # PowerShell script with Windows Forms GUI for file exploration
 
@@ -884,3 +889,4 @@ $pageSwapButton.Add_Click({
 # Show form
 $form.Add_Shown({$form.Activate()})
 [void]$form.ShowDialog()
+
