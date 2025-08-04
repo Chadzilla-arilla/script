@@ -1,4 +1,4 @@
-﻿# File Explorer GUI Script
+# File Explorer GUI Script
 # PowerShell script with Windows Forms GUI for file exploration
 
 Add-Type -AssemblyName System.Windows.Forms
@@ -153,6 +153,14 @@ $syncDatesButton.Text = "Sync Mod Date"
 $syncDatesButton.Anchor = [System.Windows.Forms.AnchorStyles]::Bottom -bor [System.Windows.Forms.AnchorStyles]::Left
 $form.Controls.Add($syncDatesButton)
 
+# Add Page Swap button
+$pageSwapButton = New-Object System.Windows.Forms.Button
+$pageSwapButton.Location = New-Object System.Drawing.Point(520, 540)
+$pageSwapButton.Size = New-Object System.Drawing.Size(100, 30)
+$pageSwapButton.Text = "Page 2"
+$pageSwapButton.Anchor = [System.Windows.Forms.AnchorStyles]::Bottom -bor [System.Windows.Forms.AnchorStyles]::Left
+$form.Controls.Add($pageSwapButton)
+
 # File count label
 $fileCountLabel = New-Object System.Windows.Forms.Label
 $fileCountLabel.Location = New-Object System.Drawing.Point(770, 545)
@@ -193,6 +201,178 @@ $statusLabel.Text = "Ready - Select a folder to begin"
 $statusLabel.Anchor = [System.Windows.Forms.AnchorStyles]::Bottom -bor [System.Windows.Forms.AnchorStyles]::Left -bor [System.Windows.Forms.AnchorStyles]::Right
 $form.Controls.Add($statusLabel)
 
+# Create legend labels for Page 2 color coding
+$legendLabel1 = New-Object System.Windows.Forms.Label
+$legendLabel1.Location = New-Object System.Drawing.Point(10, 650)
+$legendLabel1.Size = New-Object System.Drawing.Size(400, 23)
+$legendLabel1.Text = "Red = Expected files missing (both missing, or single expected file missing)"
+$legendLabel1.ForeColor = [System.Drawing.Color]::Red
+$legendLabel1.Visible = $false
+$legendLabel1.Anchor = [System.Windows.Forms.AnchorStyles]::Bottom -bor [System.Windows.Forms.AnchorStyles]::Left
+$form.Controls.Add($legendLabel1)
+
+$legendLabel2 = New-Object System.Windows.Forms.Label
+$legendLabel2.Location = New-Object System.Drawing.Point(10, 670)
+$legendLabel2.Size = New-Object System.Drawing.Size(400, 23)
+$legendLabel2.Text = "Blue = Both exe and exe64 expected, but only one found"
+$legendLabel2.ForeColor = [System.Drawing.Color]::Blue
+$legendLabel2.Visible = $false
+$legendLabel2.Anchor = [System.Windows.Forms.AnchorStyles]::Bottom -bor [System.Windows.Forms.AnchorStyles]::Left
+$form.Controls.Add($legendLabel2)
+
+# Create Page 2 controls (initially hidden)
+$page2ListView = New-Object System.Windows.Forms.ListView
+$page2ListView.Location = New-Object System.Drawing.Point(10, 110)
+$page2ListView.Size = New-Object System.Drawing.Size(960, 420)
+$page2ListView.View = [System.Windows.Forms.View]::Details
+$page2ListView.FullRowSelect = $true
+$page2ListView.GridLines = $true
+$page2ListView.MultiSelect = $false
+$page2ListView.Anchor = [System.Windows.Forms.AnchorStyles]::Top -bor [System.Windows.Forms.AnchorStyles]::Bottom -bor [System.Windows.Forms.AnchorStyles]::Left -bor [System.Windows.Forms.AnchorStyles]::Right
+$page2ListView.Visible = $false
+
+# Add columns for Page 2
+$page2ListView.Columns.Add("Section", 300) | Out-Null
+$page2ListView.Columns.Add("exe", 300) | Out-Null
+$page2ListView.Columns.Add("exe64", 300) | Out-Null
+
+$form.Controls.Add($page2ListView)
+
+# Global variable to track current page
+$global:currentPage = 1
+
+# Function to populate Page 2 table
+# Function to populate Page 2 table
+# Function to populate Page 2 table
+function Populate-Page2Table {
+    $page2ListView.Items.Clear()
+    
+    if (-not $global:nlpData -or $global:nlpData.Count -eq 0) {
+        return
+    }
+    
+    # Get all filenames from Page 1 (lowercase for comparison)
+    $page1Files = @()
+    if ($global:allFiles -and $global:allFiles.Count -gt 0) {
+        $page1Files = $global:allFiles | ForEach-Object { $_.Name.ToLower() }
+    }
+    
+    $itemsToAdd = @()
+    
+    foreach ($entry in $global:nlpData.GetEnumerator() | Where-Object Key -like 'Software*') {
+        $sectionName = $entry.Key
+        $exe = $entry.Value.exe
+        $exe64 = $entry.Value.exe64
+        
+        if ($exe -or $exe64) {
+            # Create the main item
+            $item = New-Object System.Windows.Forms.ListViewItem
+            $item.Text = $sectionName
+            
+            # Determine what files are expected and what are found
+            $exeExpected = ![string]::IsNullOrEmpty($exe)
+            $exe64Expected = ![string]::IsNullOrEmpty($exe64)
+            $exeFound = $exeExpected -and ($page1Files -contains $exe.ToLower())
+            $exe64Found = $exe64Expected -and ($page1Files -contains $exe64.ToLower())
+            
+            # Add exe column with (MISSING) prefix if not found
+            $exeValue = if ($exe) { 
+                if (!$exeFound) { "(MISSING) $exe" } else { $exe }
+            } else { "" }
+            $item.SubItems.Add($exeValue) | Out-Null
+            
+            # Add exe64 column with (MISSING) prefix if not found
+            $exe64Value = if ($exe64) { 
+                if (!$exe64Found) { "(MISSING) $exe64" } else { $exe64 }
+            } else { "" }
+            $item.SubItems.Add($exe64Value) | Out-Null
+            
+            # Color logic:
+            # Red: Both expected but both missing, OR only exe expected but missing, OR only exe64 expected but missing
+            # Blue: Both expected but only one found
+            if ($exeExpected -and $exe64Expected) {
+                # Both exe and exe64 are expected
+                if (!$exeFound -and !$exe64Found) {
+                    # Both missing = Red
+                    $item.ForeColor = [System.Drawing.Color]::Red
+                } elseif ($exeFound -xor $exe64Found) {
+                    # Only one found = Blue
+                    $item.ForeColor = [System.Drawing.Color]::Blue
+                }
+                # Both found = default black (no color change)
+            } elseif ($exeExpected -and !$exeFound) {
+                # Only exe expected but missing = Red
+                $item.ForeColor = [System.Drawing.Color]::Red
+            } elseif ($exe64Expected -and !$exe64Found) {
+                # Only exe64 expected but missing = Red
+                $item.ForeColor = [System.Drawing.Color]::Red
+            }
+            
+            $itemsToAdd += $item
+        }
+    }
+    
+    # Sort items by section name using natural numeric sorting
+    $itemsToAdd = $itemsToAdd | Sort-Object {
+        if ($_.Text -match '^Software(\d+)$') {
+            [int]$matches[1]
+        } else {
+            999999  # Put non-numeric sections at the end
+        }
+    }
+    
+    # Add sorted items to ListView
+    foreach ($item in $itemsToAdd) {
+        $page2ListView.Items.Add($item) | Out-Null
+    }
+}
+
+# Function to swap pages
+function Swap-Pages {
+    if ($global:currentPage -eq 1) {
+        # Populate Page 2 table before showing it
+        Populate-Page2Table
+        
+        # Hide Page 1 controls
+        $listView.Visible = $false
+        $runButton.Visible = $false
+        $propertiesButton.Visible = $false
+        $exportButton.Visible = $false
+        $syncDatesButton.Visible = $false
+        $fileCountLabel.Visible = $false
+        $cmdLineLabel.Visible = $false
+        $cmdLineTextBox.Visible = $false
+        
+        # Show Page 2 controls
+        $page2ListView.Visible = $true
+        $legendLabel1.Visible = $true
+        $legendLabel2.Visible = $true
+		
+        # Update button text and page tracker
+        $pageSwapButton.Text = "Page 1"
+        $global:currentPage = 2
+    } else {
+        # Hide Page 2 controls
+        $page2ListView.Visible = $false
+        $legendLabel1.Visible = $false
+        $legendLabel2.Visible = $false
+        
+        # Show Page 1 controls
+        $listView.Visible = $true
+        $runButton.Visible = $true
+        $propertiesButton.Visible = $true
+        $exportButton.Visible = $true
+        $syncDatesButton.Visible = $true
+        $fileCountLabel.Visible = $true
+        $cmdLineLabel.Visible = $true
+        $cmdLineTextBox.Visible = $true
+        
+        # Update button text and page tracker
+        $pageSwapButton.Text = "Page 2"
+        $global:currentPage = 1
+    }
+}
+
 # Function to update command line display
 function Update-CommandLineDisplay {
     if ($listView.SelectedItems.Count -gt 0) {
@@ -211,6 +391,8 @@ function Update-CommandLineDisplay {
 # Global variables
 $currentFolder = ""
 $allFiles = @()
+# Global variable to store NLP data for Page 2
+$global:nlpData = @{}
 
 # Function to get correct file description
 function Get-FileDescription {
@@ -461,6 +643,8 @@ $browseButton.Add_Click({
                 }
             }
         }
+         # Store the INI data globally for Page 2
+        $global:nlpData = $ini
         $global:exeList = $global:exeList | Sort-Object -Unique
 
         # 3) Point at the .nlp’s folder and reload non-recursively
@@ -690,6 +874,11 @@ $cmdLineTextBox.Add_Click({
     if (![string]::IsNullOrWhiteSpace($cmdLineTextBox.Text)) {
         $cmdLineTextBox.SelectAll()
     }
+})
+
+# Page swap button event handler
+$pageSwapButton.Add_Click({
+    Swap-Pages
 })
 
 # Show form
