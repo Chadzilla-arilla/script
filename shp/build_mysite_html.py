@@ -287,7 +287,7 @@ def parse_args() -> argparse.Namespace:
 
 def load_icon_map(svg_map_path: Path | None) -> Dict[str, str]:
     if svg_map_path is not None and svg_map_path.exists():
-        with svg_map_path.open(newline="", encoding="utf-8") as f:
+        with svg_map_path.open(newline="", encoding="utf-8-sig") as f:
             return parse_icon_map_text(f.read())
     return parse_icon_map_text(decode_embedded_text(EMBEDDED_SVG_MAP_B64))
 
@@ -594,8 +594,16 @@ def generate_report(
     }
 
     entries: List[Dict[str, object]] = []
-    with csv_path.open(newline="", encoding="utf-8") as f:
-        reader = csv.DictReader(f)
+    with csv_path.open(newline="", encoding="utf-8-sig") as f:
+        # Auto-detect delimiter (comma or semicolon)
+        sample = f.read(4096)
+        f.seek(0)
+        try:
+            delimiter = csv.Sniffer().sniff(sample).delimiter
+        except csv.Error:
+            delimiter = ","  # fallback to comma
+
+        reader = csv.DictReader(f, delimiter=delimiter)
         for row in reader:
             name = row["Name"].strip()
             modified = row["Modified"].strip()
