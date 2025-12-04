@@ -664,6 +664,165 @@ def inject_icon_script(
     return updated
 
 
+def detect_csv_delimiters(file_content: str) -> List[Tuple[str, int, float]]:
+    """
+    Detect possible CSV delimiters and return them with confidence scores.
+
+    Returns:
+        List of tuples (delimiter, count, confidence) sorted by confidence
+    """
+    common_delimiters = [',', ';', '\t', '|']
+    results = []
+
+    lines = file_content.split('\n')[:10]  # Check first 10 lines
+    if not lines:
+        return results
+
+    for delim in common_delimiters:
+        counts = [line.count(delim) for line in lines if line.strip()]
+        if not counts:
+            continue
+
+        # Good delimiter should have consistent count across lines
+        avg_count = sum(counts) / len(counts)
+        if avg_count > 0:
+            # Calculate consistency (lower variance = more consistent)
+            variance = sum((c - avg_count) ** 2 for c in counts) / len(counts)
+            confidence = avg_count / (1 + variance)
+            results.append((delim, int(avg_count), confidence))
+
+    # Also try csv.Sniffer
+    try:
+        sniffer_delim = csv.Sniffer().sniff(file_content[:4096]).delimiter
+        # Boost confidence for sniffer result if it's in our list
+        found = False
+        for i, (delim, count, conf) in enumerate(results):
+            if delim == sniffer_delim:
+                results[i] = (delim, count, conf * 1.5)  # Boost confidence
+                found = True
+                break
+        if not found and sniffer_delim in common_delimiters:
+            results.append((sniffer_delim, 1, 1.0))
+    except (csv.Error, Exception):
+        pass
+
+    return sorted(results, key=lambda x: x[2], reverse=True)
+
+
+def ask_delimiter_choice(delimiters: List[Tuple[str, int, float]], csv_path: Path) -> str:
+    """
+    Show a dialog asking user to choose delimiter when multiple options exist.
+
+    Args:
+        delimiters: List of (delimiter, count, confidence) tuples
+        csv_path: Path to the CSV file being parsed
+
+    Returns:
+        The chosen delimiter character
+    """
+    if not delimiters:
+        return ','
+
+    # If only one delimiter or one has significantly higher confidence, use it
+    if len(delimiters) == 1 or (len(delimiters) > 1 and delimiters[0][2] > delimiters[1][2] * 2):
+        return delimiters[0][0]
+
+    # Create dialog for user to choose
+    dialog = tk.Toplevel()
+    dialog.title("Choose CSV Delimiter")
+    dialog.resizable(False, False)
+    dialog.grab_set()  # Make modal
+
+    chosen_delim = tk.StringVar(value=delimiters[0][0])
+
+    tk.Label(
+        dialog,
+        text=f"Multiple possible delimiters detected in:\n{csv_path.name}\n\nPlease choose:",
+        justify=tk.LEFT,
+        padx=20,
+        pady=10
+    ).pack()
+
+    delim_names = {',': 'Comma (,)', ';': 'Semicolon (;)', '\t': 'Tab (\\t)', '|': 'Pipe (|)'}
+
+    frame = tk.Frame(dialog, padx=20, pady=10)
+    frame.pack()
+
+    for delim, count, confidence in delimiters[:4]:  # Show top 4 options
+        delim_name = delim_names.get(delim, f"'{delim}'")
+        label_text = f"{delim_name} - avg {count} per line (confidence: {confidence:.2f})"
+        tk.Radiobutton(
+            frame,
+            text=label_text,
+            variable=chosen_delim,
+            value=delim,
+            anchor=tk.W
+        ).pack(fill=tk.X)
+
+    def on_ok():
+        dialog.destroy()
+
+    tk.Button(dialog, text="OK", command=on_ok, padx=20).pack(pady=10)
+
+    # Center dialog
+    dialog.update_idletasks()
+    x = (dialog.winfo_screenwidth() // 2) - (dialog.winfo_width() // 2)
+    y = (dialog.winfo_screenheight() // 2) - (dialog.winfo_height() // 2)
+    dialog.geometry(f'+{x}+{y}')
+
+    dialog.wait_window()
+    return chosen_delim.get()
+
+
+def read_csv_with_encoding_detection(csv_path: Path) -> Tuple[str, str]:
+    """
+    Read CSV file and detect encoding, providing detailed error info if it fails.
+
+    Returns:
+        Tuple of (file_content, detected_encoding)
+
+    Raises:
+        RuntimeError with detailed information about encoding issues
+    """
+    encodings_to_try = ['utf-8-sig', 'utf-8', 'latin-1', 'cp1252', 'iso-8859-1']
+
+    for encoding in encodings_to_try:
+        try:
+            with csv_path.open('r', encoding=encoding, newline='') as f:
+                content = f.read()
+                return content, encoding
+        except UnicodeDecodeError as e:
+            # Save detailed error for the last encoding attempt
+            if encoding == encodings_to_try[-1]:
+                # Read file as binary to show the problematic bytes
+                with csv_path.open('rb') as fb:
+                    fb.seek(max(0, e.start - 20))
+                    context_bytes = fb.read(60)
+
+                error_msg = (
+                    f"Unicode decode error in file: {csv_path.name}\n"
+                    f"  Encoding attempted: {encoding}\n"
+                    f"  Error at byte position: {e.start}\n"
+                    f"  Reason: {e.reason}\n"
+                    f"  Problematic byte: {hex(context_bytes[min(20, e.start)])} "
+                    f"({chr(context_bytes[min(20, e.start)]) if 32 <= context_bytes[min(20, e.start)] < 127 else '?'})\n"
+                    f"  Byte context (20 bytes before and after):\n"
+                    f"    Hex: {context_bytes.hex(' ')}\n"
+                    f"    ASCII: {repr(context_bytes)}\n\n"
+                    f"Suggestion: The file may have a different encoding or contain invalid characters.\n"
+                    f"Try re-saving the CSV file with UTF-8 encoding."
+                )
+                raise RuntimeError(error_msg) from e
+            continue
+        except Exception as e:
+            raise RuntimeError(
+                f"Error reading CSV file {csv_path.name}: {type(e).__name__}: {e}"
+            ) from e
+
+    # Should never reach here
+    raise RuntimeError(f"Failed to read {csv_path.name} with any supported encoding")
+
+
 def generate_report(
     html_path: Path,
     csv_path: Path,
@@ -691,21 +850,36 @@ def generate_report(
 
     file_entries: List[Dict[str, object]] = []
     folder_entries: List[Dict[str, object]] = []
-    with csv_path.open(newline="", encoding="utf-8-sig") as f:
-        # Auto-detect delimiter (comma or semicolon)
-        sample = f.read(4096)
-        f.seek(0)
-        try:
-            delimiter = csv.Sniffer().sniff(sample).delimiter
-        except csv.Error:
-            delimiter = ","  # fallback to comma
 
-        reader = csv.DictReader(f, delimiter=delimiter)
+    # Read CSV with encoding detection and detailed error reporting
+    try:
+        csv_content, detected_encoding = read_csv_with_encoding_detection(csv_path)
+    except RuntimeError:
+        raise  # Re-raise with detailed error info from helper function
+
+    # Detect possible delimiters
+    possible_delimiters = detect_csv_delimiters(csv_content)
+
+    if not possible_delimiters:
+        # No clear delimiter found, ask user or default to comma
+        delimiter = ","
+        print(f"Warning: No clear delimiter detected in {csv_path.name}, defaulting to comma")
+    else:
+        # Ask user to choose if multiple good options exist
+        delimiter = ask_delimiter_choice(possible_delimiters, csv_path)
+
+    # Now parse the CSV with the chosen delimiter
+    try:
+        reader = csv.DictReader(csv_content.splitlines(), delimiter=delimiter)
         required_fields = {"Name", "Modified", "Path"}
         missing = required_fields - set(reader.fieldnames or [])
         if missing:
             raise RuntimeError(
-                f"CSV is missing required columns: {', '.join(sorted(missing))}"
+                f"CSV is missing required columns: {', '.join(sorted(missing))}\n"
+                f"  File: {csv_path.name}\n"
+                f"  Detected encoding: {detected_encoding}\n"
+                f"  Delimiter used: {repr(delimiter)}\n"
+                f"  Available columns: {', '.join(reader.fieldnames or [])}"
             )
 
         for row_num, row in enumerate(reader, start=2):  # header is line 1
@@ -740,12 +914,29 @@ def generate_report(
                         }
                     )
             except Exception as exc:
-                context = (
-                    f"row {row_num}: Name={row.get('Name')!r}, "
-                    f"Path={row.get('Path')!r}, Modified={row.get('Modified')!r}, "
-                    f"Item Type={row.get('Item Type')!r}"
+                # Provide detailed context about the error
+                context_info = (
+                    f"Error processing CSV at row {row_num}:\n"
+                    f"  File: {csv_path.name}\n"
+                    f"  Encoding: {detected_encoding}\n"
+                    f"  Delimiter: {repr(delimiter)}\n"
+                    f"  Row data:\n"
+                    f"    Name: {row.get('Name')!r}\n"
+                    f"    Path: {row.get('Path')!r}\n"
+                    f"    Modified: {row.get('Modified')!r}\n"
+                    f"    Item Type: {row.get('Item Type')!r}\n"
+                    f"  Error: {type(exc).__name__}: {exc}"
                 )
-                raise RuntimeError(f"Error processing CSV {context}: {exc}") from exc
+                raise RuntimeError(context_info) from exc
+
+    except csv.Error as exc:
+        raise RuntimeError(
+            f"CSV parsing error in {csv_path.name}:\n"
+            f"  Encoding used: {detected_encoding}\n"
+            f"  Delimiter used: {repr(delimiter)}\n"
+            f"  Error: {exc}\n\n"
+            f"Suggestion: The file may not be a valid CSV or may use a different delimiter."
+        ) from exc
 
     root, prefix_segments = build_tree(file_entries, folder_entries)
     propagate_timestamps(root)
