@@ -517,7 +517,8 @@ def replace_data_block(html: str, new_block: str) -> str:
         r"Array\.prototype\.p = Array\.prototype\.push;.*?delete\(Array\.prototype\.p\);\s*// remove alias added above",
         re.DOTALL,
     )
-    updated, count = pattern.subn(new_block, html, count=1)
+    # Use lambda to prevent interpreting backslashes in new_block as escape sequences
+    updated, count = pattern.subn(lambda m: new_block, html, count=1)
     if count == 0:
         raise RuntimeError(
             "Failed to replace data block in template; expected Array.prototype.p section not found."
@@ -1015,7 +1016,7 @@ def generate_report(
         html_text, "h1", f"Directory list [{root.path}] -- generated"
     )
     html_text = update_header_stats(
-        html_text, files=len(entries), folders=len(dir_entries), total_size=total_size
+        html_text, files=len(file_entries), folders=len(dir_entries), total_size=total_size
     )
     html_text = apply_style_overrides(html_text)
     html_text = inject_style(html_text)
