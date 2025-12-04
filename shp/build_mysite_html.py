@@ -5,10 +5,21 @@ import json
 import re
 import tkinter as tk
 import zlib
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 from typing import Dict, List, Optional, Tuple
+
+
+def escape_js_string(s: str) -> str:
+    """Escape Python text for safe embedding in JS double-quoted strings."""
+    return (
+        s.replace("\\", "\\\\")
+        .replace('"', '\\"')
+        .replace("'", "\\'")
+        .replace("\n", "\\n")
+        .replace("\r", "\\r")
+    )
 
 EMBEDDED_BASE64_ICONS_B64 = (
     "eJztfVt34kyy5Xv/lTNrRkii16mZdR4wkim5nakWSFDizYZqGcmU67RxCenXT+xI3QCJMpjv1M0PXsKgSyozMjMuO3bcvSxXT//7+Vv0t+Xd5u7/rtZ30ef/"
@@ -254,7 +265,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--html",
-        default="Elements(M) - 2025-11-30 19-07-48.html",
+        default="MYSITE-template.html",
         help="Source HTML report to copy and update.",
     )
     parser.add_argument(
@@ -304,14 +315,49 @@ def load_base64_icons(path: Path | None) -> Dict[str, str]:
 
 def parse_datetime(value: str) -> int:
     """
-    Parse dates in "mm/dd/yyyy hh:mm" or "mm/dd/yyyy hh:mm:ss" (24h) formats.
+    Parse a variety of date formats to a Unix timestamp.
+
+    Supports:
+    - Excel serial numbers (days since 1899-12-30, including fractional days)
+    - "mm/dd/yyyy hh:mm[:ss]" (24h)
+    - "yyyy-mm-dd[ hh:mm[:ss]]"
+    - ISO-like strings acceptable by datetime.fromisoformat (e.g., "2024-03-01T12:34:56")
     """
-    for fmt in ("%m/%d/%Y %H:%M:%S", "%m/%d/%Y %H:%M"):
+    raw = value.strip()
+    # Excel serial number (may include fractional day for time of day)
+    try:
+        excel_number = float(raw)
+        if excel_number >= 0:
+            excel_epoch = datetime(1899, 12, 30)  # Excel's serial 0
+            dt = excel_epoch + timedelta(days=excel_number)
+            return int(dt.timestamp())
+    except ValueError:
+        pass
+
+    formats = [
+        "%m/%d/%Y %H:%M:%S",
+        "%m/%d/%Y %H:%M",
+        "%m/%d/%Y",
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%d %H:%M",
+        "%Y-%m-%d",
+    ]
+    for fmt in formats:
         try:
-            return int(datetime.strptime(value, fmt).timestamp())
+            return int(datetime.strptime(raw, fmt).timestamp())
         except ValueError:
             continue
-    raise ValueError(f"Unrecognized date format: {value!r}")
+
+    # Last-chance parse for ISO-like inputs (adds basic Z handling)
+    try:
+        iso_value = raw.replace("Z", "+00:00")
+        return int(datetime.fromisoformat(iso_value).timestamp())
+    except ValueError:
+        raise ValueError(
+            f"Unrecognized date format: {value!r}. "
+            "Supported: Excel serial, mm/dd/yyyy[ hh:mm[:ss]], "
+            "yyyy-mm-dd[ hh:mm[:ss]], ISO-like strings."
+        ) from None
 
 
 def common_prefix_segments(paths: List[str]) -> List[str]:
@@ -367,8 +413,12 @@ class DirNode:
             self.timestamp = timestamp
 
 
-def build_tree(entries: List[Dict[str, str]]) -> Tuple[DirNode, List[str]]:
-    dir_paths = [entry["dir_path"] for entry in entries]
+def build_tree(
+    files: List[Dict[str, object]], folders: List[Dict[str, object]]
+) -> Tuple[DirNode, List[str]]:
+    dir_paths = [entry["dir_path"] for entry in files] + [
+        folder["dir_path"] for folder in folders
+    ]
     prefix_segments = common_prefix_segments(dir_paths)
     if not prefix_segments and dir_paths:
         # Fallback to the first segment so we always have a root.
@@ -376,9 +426,8 @@ def build_tree(entries: List[Dict[str, str]]) -> Tuple[DirNode, List[str]]:
     root_path = "/".join(prefix_segments)
     root = DirNode(root_path)
 
-    for entry in entries:
-        dir_path = entry["dir_path"]
-        parts = dir_path.split("/")
+    def ensure_path(path: str) -> DirNode:
+        parts = path.split("/")
         idx = len(prefix_segments)
         node = root
         while idx < len(parts):
@@ -386,6 +435,10 @@ def build_tree(entries: List[Dict[str, str]]) -> Tuple[DirNode, List[str]]:
             full = "/".join(parts[: idx + 1])
             node = node.ensure_child(seg, full)
             idx += 1
+        return node
+
+    for entry in files:
+        node = ensure_path(entry["dir_path"])
         node.add_file(
             entry["filename"],
             entry["timestamp"],
@@ -394,6 +447,13 @@ def build_tree(entries: List[Dict[str, str]]) -> Tuple[DirNode, List[str]]:
             entry["url"],
             entry["size"],
         )
+
+    for folder in folders:
+        node = ensure_path(folder["dir_path"])
+        ts = folder.get("timestamp")
+        if ts is not None:
+            node.timestamp = ts if node.timestamp is None else max(node.timestamp, ts)
+
     return root, prefix_segments
 
 
@@ -441,26 +501,41 @@ def replace_data_block(html: str, new_block: str) -> str:
         r"Array\.prototype\.p = Array\.prototype\.push;.*?delete\(Array\.prototype\.p\);\s*// remove alias added above",
         re.DOTALL,
     )
-    return pattern.sub(new_block, html, count=1)
+    updated, count = pattern.subn(new_block, html, count=1)
+    if count == 0:
+        raise RuntimeError(
+            "Failed to replace data block in template; expected Array.prototype.p section not found."
+        )
+    return updated
 
 
 def replace_var(html: str, var_name: str, value: str | int) -> str:
-    return re.sub(
+    updated, count = re.subn(
         rf"var {re.escape(var_name)} = .*?;",
         f"var {var_name} = {json.dumps(value)};",
         html,
         count=1,
     )
+    if count == 0:
+        raise RuntimeError(
+            f"Failed to replace JS var {var_name!r} in template; declaration not found."
+        )
+    return updated
 
 
 def replace_text_tag(html: str, tag: str, new_text: str) -> str:
-    return re.sub(
+    updated, count = re.subn(
         rf"<{tag}>.*?</{tag}>",
         f"<{tag}>{new_text}</{tag}>",
         html,
         count=1,
         flags=re.DOTALL,
     )
+    if count == 0:
+        raise RuntimeError(
+            f"Failed to replace <{tag}> content in template; tag not found."
+        )
+    return updated
 
 
 def update_header_stats(html: str, files: int, folders: int, total_size: int) -> str:
@@ -469,13 +544,18 @@ def update_header_stats(html: str, files: int, folders: int, total_size: int) ->
         f"(<span id=\"tot_size\">{total_size}</span>) | File System: Virtual<br>"
         f"Report time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} -- updated from mysite.csv"
     )
-    return re.sub(
+    updated, count = re.subn(
         r'<div class="app_header_stats">.*?</div>',
         f'<div class="app_header_stats">{new_stats}</div>',
         html,
         count=1,
         flags=re.DOTALL,
     )
+    if count == 0:
+        raise RuntimeError(
+            "Failed to update header stats; app_header_stats div not found in template."
+        )
+    return updated
 
 
 STYLE_OVERRIDES: list[tuple[str, str]] = [
@@ -522,17 +602,30 @@ def inject_icon_script(
     link_icon: str,
 ) -> str:
     icon_json = json.dumps(icon_map, separators=(",", ":"))
+    escaped_default = escape_js_string(default_icon)
+    escaped_folder = escape_js_string(folder_icon)
+    escaped_link = escape_js_string(link_icon)
     script = f"""
 \t<script type="text/javascript">
 \t\t// icon rendering injected by build_mysite_html.py
 \t\tconst ICON_MAP = {icon_json};
-\t\tconst DEFAULT_ICON = "{default_icon}";
-\t\tconst FOLDER_ICON = "{folder_icon}";
-\t\tconst LINK_ICON = "{link_icon}";
+\t\tconst DEFAULT_ICON = "{escaped_default}";
+\t\tconst FOLDER_ICON = "{escaped_folder}";
+\t\tconst LINK_ICON = "{escaped_link}";
 
 \t\tfunction iconForFilename(name) {{
 \t\t\tconst ext = name.toLowerCase().split('.').pop();
-\t\t\treturn ICON_MAP[ext] || DEFAULT_ICON;
+\t\t\tlet icon = ICON_MAP[ext];
+\t\t\tconst visited = new Set([ext]);
+\t\t\twhile (typeof icon === 'string' && !icon.startsWith('data:')) {{
+\t\t\t\tif (visited.has(icon)) {{
+\t\t\t\t\ticon = undefined;
+\t\t\t\t\tbreak;
+\t\t\t\t}}
+\t\t\t\tvisited.add(icon);
+\t\t\t\ticon = ICON_MAP[icon];
+\t\t\t}}
+\t\t\treturn (typeof icon === 'string' && icon.startsWith('data:')) ? icon : DEFAULT_ICON;
 \t\t}}
 
 \t\tfunction applyIcons(container) {{
@@ -565,7 +658,10 @@ def inject_icon_script(
 \t\tdocument.addEventListener('DOMContentLoaded', attachIconObserver);
 \t</script>
 """
-    return html.replace("</head>", script + "\n</head>", 1)
+    updated = html.replace("</head>", script + "\n</head>", 1)
+    if updated == html:
+        raise RuntimeError("Failed to inject icon script; closing </head> tag not found.")
+    return updated
 
 
 def generate_report(
@@ -593,7 +689,8 @@ def generate_report(
         for ext, icon_name in icon_map.items()
     }
 
-    entries: List[Dict[str, object]] = []
+    file_entries: List[Dict[str, object]] = []
+    folder_entries: List[Dict[str, object]] = []
     with csv_path.open(newline="", encoding="utf-8-sig") as f:
         # Auto-detect delimiter (comma or semicolon)
         sample = f.read(4096)
@@ -604,29 +701,53 @@ def generate_report(
             delimiter = ","  # fallback to comma
 
         reader = csv.DictReader(f, delimiter=delimiter)
-        for row in reader:
-            name = row["Name"].strip()
-            modified = row["Modified"].strip()
-            path_raw = row["Path"].strip().rstrip("/")
-            # remove trailing filename if present so path is folder only
-            dir_path = path_raw
-            if path_raw.lower().endswith(name.lower()):
-                dir_path = path_raw[: -len(name)].rstrip("/")
-            if not dir_path:
-                dir_path = path_raw or "root"
-            entries.append(
-                {
-                    "filename": name,
-                    "timestamp": parse_datetime(modified),
-                    "dir_path": dir_path,
-                    "size": 0,
-                    "modified_by": row.get("Modified By", "").strip(),
-                    "item_type": row.get("Item Type", "").strip(),
-                    "url": row.get("URL", "").strip(),
-                }
+        required_fields = {"Name", "Modified", "Path"}
+        missing = required_fields - set(reader.fieldnames or [])
+        if missing:
+            raise RuntimeError(
+                f"CSV is missing required columns: {', '.join(sorted(missing))}"
             )
 
-    root, prefix_segments = build_tree(entries)
+        for row_num, row in enumerate(reader, start=2):  # header is line 1
+            try:
+                name = row["Name"].strip()
+                modified = row["Modified"].strip()
+                path_raw = row["Path"].strip().rstrip("/")
+                item_type = row.get("Item Type", "").strip()
+                is_folder = item_type.lower() == "folder"
+                dir_path = path_raw
+                if not is_folder:
+                    # remove trailing filename if present so path is folder only
+                    if path_raw.lower().endswith(name.lower()):
+                        dir_path = path_raw[: -len(name)].rstrip("/")
+                if not dir_path:
+                    dir_path = path_raw or "root"
+
+                parsed_ts = parse_datetime(modified)
+
+                if is_folder:
+                    folder_entries.append({"dir_path": dir_path, "timestamp": parsed_ts})
+                else:
+                    file_entries.append(
+                        {
+                            "filename": name,
+                            "timestamp": parsed_ts,
+                            "dir_path": dir_path,
+                            "size": 0,
+                            "modified_by": row.get("Modified By", "").strip(),
+                            "item_type": item_type,
+                            "url": row.get("URL", "").strip(),
+                        }
+                    )
+            except Exception as exc:
+                context = (
+                    f"row {row_num}: Name={row.get('Name')!r}, "
+                    f"Path={row.get('Path')!r}, Modified={row.get('Modified')!r}, "
+                    f"Item Type={row.get('Item Type')!r}"
+                )
+                raise RuntimeError(f"Error processing CSV {context}: {exc}") from exc
+
+    root, prefix_segments = build_tree(file_entries, folder_entries)
     propagate_timestamps(root)
     dir_entries = generate_dir_entries(root)
 
@@ -639,7 +760,7 @@ def generate_report(
 
     html_text = html_path.read_text(encoding="utf-8")
     html_text = replace_data_block(html_text, new_d_block)
-    html_text = replace_var(html_text, "numberOfFiles", len(entries))
+    html_text = replace_var(html_text, "numberOfFiles", len(file_entries))
     html_text = replace_var(html_text, "sourceRoot", root.path)
 
     total_size = tree_total_size(root)
