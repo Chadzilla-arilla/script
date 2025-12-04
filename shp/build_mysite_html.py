@@ -467,6 +467,14 @@ def propagate_timestamps(node: DirNode) -> None:
         node.timestamp = max(child_ts) if child_ts else int(datetime.now().timestamp())
 
 
+def sanitize_backslashes(text: str) -> str:
+    """
+    Replace backslashes with forward slashes to avoid JSON escape issues.
+    Windows paths like C:\\users will become C:/users
+    """
+    return text.replace("\\", "/")
+
+
 def generate_dir_entries(node: DirNode) -> List[List[object]]:
     entries: List[List[object]] = []
 
@@ -476,9 +484,11 @@ def generate_dir_entries(node: DirNode) -> List[List[object]]:
         child_ids: List[int] = []
         for name in sorted(current.children):
             child_ids.append(walk(current.children[name]))
-        dir_info = f"{current.path}*{current.dir_size}*{current.timestamp}*268435456*D"
+
+        # Sanitize all string fields to avoid backslash escape issues
+        dir_info = f"{sanitize_backslashes(current.path)}*{current.dir_size}*{current.timestamp}*268435456*D"
         files = [
-            f"{f['name']}*{f['timestamp']}*{f['modified_by']}*{f['item_type']}*{f['url']}"
+            f"{sanitize_backslashes(f['name'])}*{f['timestamp']}*{sanitize_backslashes(f['modified_by'])}*{sanitize_backslashes(f['item_type'])}*{sanitize_backslashes(f['url'])}"
             for f in current.files
         ]
         subdir_str = "*".join(str(cid) for cid in child_ids) if child_ids else ""
@@ -942,7 +952,43 @@ def generate_report(
     propagate_timestamps(root)
     dir_entries = generate_dir_entries(root)
 
-    d_lines = [f"D.p({json.dumps(entry, separators=(',', ':'))})" for entry in dir_entries]
+    # Serialize entries to JSON with detailed error handling
+    d_lines = []
+    for entry_idx, entry in enumerate(dir_entries):
+        try:
+            json_str = json.dumps(entry, separators=(',', ':'))
+            d_lines.append(f"D.p({json_str})")
+        except (ValueError, TypeError) as exc:
+            # Provide detailed context about which entry failed
+            error_details = (
+                f"JSON serialization error at entry index {entry_idx}:\n"
+                f"  Error: {type(exc).__name__}: {exc}\n"
+                f"  Entry data (first 500 chars): {str(entry)[:500]}\n"
+            )
+
+            # Try to identify which field has the problem
+            if isinstance(entry, list) and entry:
+                error_details += f"\n  Entry has {len(entry)} elements\n"
+                for i, item in enumerate(entry):
+                    try:
+                        json.dumps(item)
+                    except (ValueError, TypeError) as item_exc:
+                        error_details += (
+                            f"  Problem in element {i}: {type(item_exc).__name__}: {item_exc}\n"
+                            f"    Content: {repr(str(item)[:200])}\n"
+                        )
+                        # Check for backslash issues
+                        item_str = str(item)
+                        if '\\' in item_str:
+                            # Find positions of backslashes
+                            positions = [i for i, c in enumerate(item_str) if c == '\\']
+                            error_details += f"    Found backslashes at positions: {positions[:10]}\n"
+                            for pos in positions[:5]:
+                                context = item_str[max(0, pos-10):min(len(item_str), pos+10)]
+                                error_details += f"      Context around pos {pos}: {repr(context)}\n"
+
+            raise RuntimeError(error_details) from exc
+
     new_d_block = (
         "Array.prototype.p = Array.prototype.push;\n\n"
         + "\n".join(d_lines)
