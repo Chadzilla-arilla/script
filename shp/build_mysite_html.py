@@ -4,6 +4,7 @@ import csv
 import json
 import re
 import tkinter as tk
+import traceback
 import zlib
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -471,7 +472,12 @@ def sanitize_backslashes(text: str) -> str:
     """
     Replace backslashes with forward slashes to avoid JSON escape issues.
     Windows paths like C:\\users will become C:/users
+    Also handles other problematic characters.
     """
+    if not isinstance(text, str):
+        return text
+    # Replace all backslashes with forward slashes
+    # This prevents issues like \u, \x, \n, etc. that aren't actual escape sequences
     return text.replace("\\", "/")
 
 
@@ -894,10 +900,11 @@ def generate_report(
 
         for row_num, row in enumerate(reader, start=2):  # header is line 1
             try:
-                name = row["Name"].strip()
+                # Sanitize all input data immediately to prevent escape sequence issues
+                name = sanitize_backslashes(row["Name"].strip())
                 modified = row["Modified"].strip()
-                path_raw = row["Path"].strip().rstrip("/")
-                item_type = row.get("Item Type", "").strip()
+                path_raw = sanitize_backslashes(row["Path"].strip()).rstrip("/")
+                item_type = sanitize_backslashes(row.get("Item Type", "").strip())
                 is_folder = item_type.lower() == "folder"
                 dir_path = path_raw
                 if not is_folder:
@@ -910,17 +917,17 @@ def generate_report(
                 parsed_ts = parse_datetime(modified)
 
                 if is_folder:
-                    folder_entries.append({"dir_path": dir_path, "timestamp": parsed_ts})
+                    folder_entries.append({"dir_path": sanitize_backslashes(dir_path), "timestamp": parsed_ts})
                 else:
                     file_entries.append(
                         {
                             "filename": name,
                             "timestamp": parsed_ts,
-                            "dir_path": dir_path,
+                            "dir_path": sanitize_backslashes(dir_path),
                             "size": 0,
-                            "modified_by": row.get("Modified By", "").strip(),
+                            "modified_by": sanitize_backslashes(row.get("Modified By", "").strip()),
                             "item_type": item_type,
-                            "url": row.get("URL", "").strip(),
+                            "url": sanitize_backslashes(row.get("URL", "").strip()),
                         }
                     )
             except Exception as exc:
@@ -1069,8 +1076,27 @@ def launch_gui(
                 Path(path_vars["output"].get()) if path_vars["output"].get() else None,
             )
         except Exception as exc:  # noqa: BLE001
+            # Get full traceback for debugging
+            tb = traceback.format_exc()
+
+            # Write detailed error to log file
+            log_path = Path(path_vars["csv"].get()).with_suffix('.error.log')
+            try:
+                with log_path.open('w', encoding='utf-8') as log:
+                    log.write("="*80 + "\n")
+                    log.write("BUILD ERROR DETAILS\n")
+                    log.write("="*80 + "\n\n")
+                    log.write(f"Error Type: {type(exc).__name__}\n")
+                    log.write(f"Error Message: {exc}\n\n")
+                    log.write("Full Traceback:\n")
+                    log.write(tb)
+                    log.write("\n" + "="*80 + "\n")
+                error_msg = f"{exc}\n\nFull details written to:\n{log_path}"
+            except:
+                error_msg = f"{exc}\n\n{tb}"
+
             status_var.set(f"Error: {exc}")
-            messagebox.showerror("Build failed", str(exc))
+            messagebox.showerror("Build failed", error_msg)
             return
         status_var.set(f"Wrote {output_path}")
         messagebox.showinfo("Build complete", f"Wrote\n{output_path}")
