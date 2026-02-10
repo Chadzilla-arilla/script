@@ -4,6 +4,7 @@ import sys
 import time
 import queue
 import json
+import stat
 import sqlite3
 import threading
 from pathlib import Path
@@ -95,7 +96,8 @@ PRAGMA temp_store=MEMORY;
 PRAGMA foreign_keys=ON;
 
 CREATE TABLE IF NOT EXISTS roots (
-    root TEXT PRIMARY KEY
+    root TEXT PRIMARY KEY,
+    max_depth INTEGER NOT NULL DEFAULT -1
 );
 
 CREATE TABLE IF NOT EXISTS files (
@@ -155,7 +157,18 @@ def connect_db(db_path: str) -> sqlite3.Connection:
     conn.execute("PRAGMA busy_timeout=5000;")
     conn.execute("PRAGMA foreign_keys=ON;")
     conn.executescript(SCHEMA)
+    _migrate_schema(conn)
     return conn
+
+
+def _migrate_schema(conn: sqlite3.Connection) -> None:
+    try:
+        cols = [r[1] for r in conn.execute("PRAGMA table_info(roots)").fetchall()]
+        if "max_depth" not in cols:
+            conn.execute("ALTER TABLE roots ADD COLUMN max_depth INTEGER NOT NULL DEFAULT -1")
+            conn.commit()
+    except sqlite3.DatabaseError:
+        pass
 
 
 def fmt_ts(ts: float) -> str:
@@ -293,8 +306,10 @@ class App(tk.Tk):
         self._root_filter_popup: tk.Menu | None = None
         self._file_root_filter_menu: tk.Menu | None = None
         self._ordered_roots: list[str] = []
+        self._root_depths: dict[str, int] = {}
         self._config_window: tk.Toplevel | None = None
         self._config_db_path_var = tk.StringVar(value=str(self.db_path))
+        self.depth_var = tk.StringVar(value="All")
         self._min_col_widths = {
             "name": 260,
             "ext": 35,
@@ -367,6 +382,18 @@ class App(tk.Tk):
         )
         self.roots_box.pack(side="left", padx=8, fill="x", expand=True)
         self.roots_box.bind("<Button-3>", self._on_roots_box_right_click)
+        self.roots_box.bind("<<ComboboxSelected>>", self._on_root_selected)
+
+        ttk.Label(r1, text="Depth:").pack(side="left", padx=(6, 2))
+        depth_values = ["All"] + [str(i) for i in range(0, 51)]
+        self.depth_box = ttk.Combobox(
+            r1,
+            textvariable=self.depth_var,
+            values=depth_values,
+            width=5,
+            state="readonly",
+        )
+        self.depth_box.pack(side="left")
 
         ttk.Button(r1, text="Add root + Reindex", command=self.on_add_root).pack(
             side="left", padx=6
@@ -374,6 +401,9 @@ class App(tk.Tk):
         ttk.Button(
             r1, text="Reindex selected root", command=self.on_reindex_selected
         ).pack(side="left")
+        ttk.Button(r1, text="Save depth", command=self.on_set_depth_selected).pack(
+            side="left", padx=(6, 0)
+        )
 
         # Row 2: search controls
         r2 = ttk.Frame(top)
@@ -572,12 +602,25 @@ class App(tk.Tk):
     def _on_root_filter_change(self):
         self._apply_root_filter_to_current_results()
 
+    def _path_dedupe_key(self, path: str) -> str:
+        return os.path.normcase(os.path.normpath(path or ""))
+
     def _apply_root_filter_to_current_results(self):
         selected = set(self._selected_search_roots())
         if not selected:
             visible_rows = []
         else:
-            visible_rows = [row for row in self._current_results if row[0] in selected]
+            visible_rows = []
+            seen_keys = set()
+            for row in self._current_results:
+                root = row[0]
+                if root not in selected:
+                    continue
+                key = self._path_dedupe_key(row[6])
+                if key in seen_keys:
+                    continue
+                seen_keys.add(key)
+                visible_rows.append(row)
         self._set_results_count(len(visible_rows))
         self._populate_results(visible_rows, keep_current=False)
 
@@ -771,9 +814,74 @@ class App(tk.Tk):
             self._set_status("Ready")
         self._close_config_window()
 
+    def _depth_to_label(self, depth: int) -> str:
+        if depth is None or int(depth) < 0:
+            return "All"
+        return str(int(depth))
+
+    def _depth_from_control(self) -> int | None:
+        raw = (self.depth_var.get() or "").strip()
+        if not raw:
+            raw = "All"
+        if raw.lower() == "all":
+            return -1
+        try:
+            value = int(raw)
+        except ValueError:
+            messagebox.showerror(
+                "Invalid depth", "Depth must be 'All' or an integer 0 or greater."
+            )
+            return None
+        if value < 0:
+            messagebox.showerror(
+                "Invalid depth", "Depth must be 'All' or an integer 0 or greater."
+            )
+            return None
+        return value
+
+    def _selected_root_depth(self, root: str) -> int:
+        return int(self._root_depths.get(root, -1))
+
+    def _sync_depth_control_for_selected_root(self):
+        root = self.roots_var.get().strip()
+        if not root:
+            self.depth_var.set("All")
+            return
+        self.depth_var.set(self._depth_to_label(self._selected_root_depth(root)))
+
+    def _on_root_selected(self, _event=None):
+        self._sync_depth_control_for_selected_root()
+
+    def _save_root_depth(self, root: str, depth: int):
+        self.conn.execute(
+            """
+            INSERT INTO roots(root, max_depth) VALUES(?, ?)
+            ON CONFLICT(root) DO UPDATE SET max_depth = excluded.max_depth
+            """,
+            (root, int(depth)),
+        )
+        self.conn.commit()
+        self._root_depths[root] = int(depth)
+        self._sync_depth_control_for_selected_root()
+
+    def on_set_depth_selected(self):
+        root = self.roots_var.get().strip()
+        if not root:
+            messagebox.showinfo("Depth", "No root selected.")
+            return
+        depth = self._depth_from_control()
+        if depth is None:
+            return
+        self._save_root_depth(root, depth)
+        self._set_status("Ready")
+
     def _load_roots(self):
-        cur = self.conn.execute("SELECT root FROM roots ORDER BY root")
-        roots = [r[0] for r in cur.fetchall()]
+        cur = self.conn.execute(
+            "SELECT root, COALESCE(max_depth, -1) FROM roots ORDER BY root"
+        )
+        rows = cur.fetchall()
+        roots = [r[0] for r in rows]
+        self._root_depths = {r[0]: int(r[1]) for r in rows}
         if not roots:
             # Recover roots list from file entries if roots table is empty.
             recovered = [
@@ -784,11 +892,12 @@ class App(tk.Tk):
             ]
             if recovered:
                 self.conn.executemany(
-                    "INSERT OR IGNORE INTO roots(root) VALUES(?)",
+                    "INSERT OR IGNORE INTO roots(root, max_depth) VALUES(?, -1)",
                     [(r,) for r in recovered],
                 )
                 self.conn.commit()
                 roots = recovered
+                self._root_depths = {r: -1 for r in recovered}
         prev_states = {root: var.get() for root, var in self._root_filter_vars.items()}
         self._ordered_roots = roots
         self._root_filter_vars = {
@@ -800,6 +909,7 @@ class App(tk.Tk):
             self.roots_var.set(roots[0])
         if self.roots_var.get() and self.roots_var.get() not in roots:
             self.roots_var.set(roots[0] if roots else "")
+        self._sync_depth_control_for_selected_root()
 
     def _db_summary_text(self) -> str:
         try:
@@ -969,18 +1079,24 @@ class App(tk.Tk):
         if not root:
             return
         root = str(Path(root).resolve())
-        self.conn.execute("INSERT OR IGNORE INTO roots(root) VALUES(?)", (root,))
-        self.conn.commit()
+        depth = self._depth_from_control()
+        if depth is None:
+            return
+        self._save_root_depth(root, depth)
         self._load_roots()
         self.roots_var.set(root)
-        self._start_index_job(root)
+        self._start_index_job(root, depth)
 
     def on_reindex_selected(self):
         root = self.roots_var.get().strip()
         if not root:
             messagebox.showinfo("Reindex", "No root selected.")
             return
-        self._start_index_job(root)
+        depth = self._depth_from_control()
+        if depth is None:
+            return
+        self._save_root_depth(root, depth)
+        self._start_index_job(root, depth)
 
     def on_remove_root(self):
         root = self.roots_var.get().strip()
@@ -1002,18 +1118,21 @@ class App(tk.Tk):
         self._set_results_count(0)
         self._set_status("Ready")
 
-    def _start_index_job(self, root: str):
+    def _start_index_job(self, root: str, max_depth: int | None = None):
         if self.worker and self.worker.is_alive():
             messagebox.showinfo("Busy", "A job is already running.")
             return
+        if max_depth is None:
+            max_depth = self._selected_root_depth(root)
         self.stop_flag.clear()
-        self._set_status(f"Indexing: {root}")
+        depth_label = self._depth_to_label(max_depth)
+        self._set_status(f"Indexing: {root} (depth: {depth_label})")
         self.worker = threading.Thread(
-            target=self._index_root_worker, args=(root,), daemon=True
+            target=self._index_root_worker, args=(root, int(max_depth)), daemon=True
         )
         self.worker.start()
 
-    def _index_root_worker(self, root: str):
+    def _index_root_worker(self, root: str, max_depth: int):
         root_path = str(Path(root).resolve())
         t0 = time.time()
         run_id: int | None = None
@@ -1033,9 +1152,9 @@ class App(tk.Tk):
             ).lastrowid
             self.conn.commit()
 
-            stack = [root_path]
+            stack: list[tuple[str, int]] = [(root_path, 0)]
             while stack and not self.stop_flag.is_set():
-                curdir = stack.pop()
+                curdir, cur_depth = stack.pop()
                 try:
                     with os.scandir(curdir) as it:
                         for entry in it:
@@ -1043,35 +1162,56 @@ class App(tk.Tk):
                                 break
                             try:
                                 if entry.is_dir(follow_symlinks=False):
-                                    stack.append(entry.path)
-                                elif entry.is_file(follow_symlinks=False):
-                                    st = entry.stat(follow_symlinks=False)
-                                    p = str(Path(entry.path).resolve())
-                                    name = entry.name
-                                    ext = norm_ext_from_name(name)
-                                    seen.add(p)
-                                    to_upsert.append(
+                                    if max_depth < 0 or cur_depth < max_depth:
+                                        stack.append((entry.path, cur_depth + 1))
+                                    continue
+
+                                # OneDrive placeholders may not always report as files
+                                # with follow_symlinks=False; fall back to stat mode.
+                                st = None
+                                is_file = entry.is_file(follow_symlinks=False)
+                                if not is_file:
+                                    st = entry.stat(follow_symlinks=True)
+                                    is_file = stat.S_ISREG(st.st_mode)
+                                if not is_file:
+                                    continue
+
+                                if st is None:
+                                    try:
+                                        st = entry.stat(follow_symlinks=False)
+                                    except (PermissionError, FileNotFoundError, OSError):
+                                        st = entry.stat(follow_symlinks=True)
+
+                                p = os.path.normpath(os.path.abspath(entry.path))
+                                name = entry.name
+                                ext = norm_ext_from_name(name)
+                                seen.add(p)
+                                to_upsert.append(
+                                    (
+                                        p,
+                                        root_path,
+                                        name,
+                                        name.lower(),
+                                        ext,
+                                        int(st.st_size),
+                                        float(st.st_ctime),
+                                        float(st.st_mtime),
+                                    )
+                                )
+                                total_files += 1
+                                if len(to_upsert) >= 5000:
+                                    self._flush_upsert(to_upsert)
+                                    to_upsert.clear()
+                                    self.msg_q.put(
                                         (
-                                            p,
-                                            root_path,
-                                            name,
-                                            name.lower(),
-                                            ext,
-                                            int(st.st_size),
-                                            float(st.st_ctime),
-                                            float(st.st_mtime),
+                                            "status",
+                                            (
+                                                f"Indexing: {root_path} "
+                                                f"(depth: {self._depth_to_label(max_depth)}) "
+                                                f"(files: {total_files:,})"
+                                            ),
                                         )
                                     )
-                                    total_files += 1
-                                    if len(to_upsert) >= 5000:
-                                        self._flush_upsert(to_upsert)
-                                        to_upsert.clear()
-                                        self.msg_q.put(
-                                            (
-                                                "status",
-                                                f"Indexing: {root_path}  (files: {total_files:,})",
-                                            )
-                                        )
                             except (PermissionError, FileNotFoundError, OSError) as exc:
                                 skipped += 1
                                 access_errors += 1
